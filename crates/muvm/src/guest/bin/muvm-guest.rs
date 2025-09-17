@@ -111,6 +111,20 @@ fn main() -> Result<()> {
         Err(err) => return Err(err).context("Failed to set up user, bailing out"),
     };
 
+    for init_command in options.user_init_commands {
+        let code = Command::new(&init_command)
+            .current_dir(&options.cwd)
+            .spawn()
+            .context(format!(
+                "Failed to spawn user init command `{}`",
+                init_command.display()
+            ))?
+            .wait()?;
+        if !code.success() {
+            return Err(anyhow!("Executing `{}` failed", init_command.display()));
+        }
+    }
+
     let pulse_path = run_path.join("pulse");
     std::fs::create_dir(&pulse_path)
         .context("Failed to create `pulse` directory in `XDG_RUNTIME_DIR`")?;
