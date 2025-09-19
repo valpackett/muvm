@@ -44,6 +44,7 @@ pub struct GuestConfiguration {
     pub merged_rootfs: bool,
     pub emulator: Option<Emulator>,
     pub cwd: PathBuf,
+    pub udevd_path: Option<PathBuf>,
     pub init_commands: Vec<PathBuf>,
 }
 

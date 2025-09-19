@@ -22,6 +22,7 @@ pub struct Options {
     pub publish_ports: Vec<String>,
     pub emulator: Option<Emulator>,
     pub init_commands: Vec<PathBuf>,
+    pub udevd_path: Option<PathBuf>,
     pub command: PathBuf,
     pub command_args: Vec<String>,
 }
@@ -142,6 +143,10 @@ pub fn options() -> OptionParser<Options> {
         )
         .argument("COMMAND")
         .many();
+    let udevd_path = long("udevd-path")
+        .help("Path to the systemd-udevd binary to spawn inside of the VM.")
+        .argument("PATH")
+        .optional();
     let command = positional("COMMAND").help("the command you want to execute in the vm");
     let command_args = any::<String, _, _>("COMMAND_ARGS", |arg| {
         (!["--help", "-h"].contains(&&*arg)).then_some(arg)
@@ -164,6 +169,7 @@ pub fn options() -> OptionParser<Options> {
         emulator,
         init_commands,
         // positionals
+        udevd_path,
         command,
         command_args,
     })

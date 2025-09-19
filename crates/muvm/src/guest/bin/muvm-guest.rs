@@ -77,9 +77,17 @@ fn main() -> Result<()> {
     rustix::stdio::dup2_stdout(console.as_fd())?;
     rustix::stdio::dup2_stderr(console.as_fd())?;
 
-    Command::new(std::option_env!("MUVM_UDEVD_PATH").unwrap_or("/usr/lib/systemd/systemd-udevd"))
-        .spawn()
-        .context("Running systemd-udevd")?;
+    const DEFAULT_UDEVD_PATH: &'static str = match std::option_env!("MUVM_UDEVD_PATH") {
+        Some(path) => path,
+        None => "/usr/lib/systemd/systemd-udevd",
+    };
+    Command::new(
+        options
+            .udevd_path
+            .unwrap_or_else(|| DEFAULT_UDEVD_PATH.parse().unwrap()),
+    )
+    .spawn()
+    .context("Running systemd-udevd")?;
 
     if let Some(emulator) = options.emulator {
         match emulator {

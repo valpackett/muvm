@@ -404,6 +404,7 @@ fn main() -> Result<ExitCode> {
         merged_rootfs: options.merged_rootfs,
         emulator: options.emulator,
         cwd,
+        udevd_path: options.udevd_path,
         init_commands,
     };
     let mut muvm_config_file = NamedTempFile::new()
