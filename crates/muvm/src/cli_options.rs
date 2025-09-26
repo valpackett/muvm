@@ -46,6 +46,8 @@ pub struct Options {
     pub publish_ports: Vec<String>,
     pub emulator: Option<Emulator>,
     pub init_commands: Vec<PathBuf>,
+    pub user_init_commands: Vec<PathBuf>,
+    pub udevd_path: Option<PathBuf>,
     pub command: PathBuf,
     pub command_args: Vec<String>,
 }
@@ -164,12 +166,24 @@ pub fn options() -> OptionParser<Options> {
     let init_commands = long("execute-pre")
         .short('x')
         .help(
-            "Command to run inside the VM before guest server starts.
+            "Command to run inside the VM before guest server starts, while still running as root.
             Can be used for e.g. setting up additional mounts.
             Can be specified multiple times.",
         )
         .argument("COMMAND")
         .many();
+    let user_init_commands = long("user-execute-pre")
+        .short('X')
+        .help(
+            "Command to run inside the VM before guest server starts, but after the user is set up.
+            Can be specified multiple times.",
+        )
+        .argument("COMMAND")
+        .many();
+    let udevd_path = long("udevd-path")
+        .help("Path to the systemd-udevd binary to spawn inside of the VM.")
+        .argument("PATH")
+        .optional();
     let command = positional("COMMAND").help("the command you want to execute in the vm");
     let command_args = any::<String, _, _>("COMMAND_ARGS", |arg| {
         (!["--help", "-h"].contains(&&*arg)).then_some(arg)
@@ -192,7 +206,9 @@ pub fn options() -> OptionParser<Options> {
         publish_ports,
         emulator,
         init_commands,
+        user_init_commands,
         // positionals
+        udevd_path,
         command,
         command_args,
     })

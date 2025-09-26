@@ -77,27 +77,44 @@ fn main() -> Result<()> {
     rustix::stdio::dup2_stdout(console.as_fd())?;
     rustix::stdio::dup2_stderr(console.as_fd())?;
 
-    Command::new("/usr/lib/systemd/systemd-udevd").spawn()?;
+    const DEFAULT_UDEVD_PATH: &'static str = match std::option_env!("MUVM_UDEVD_PATH") {
+        Some(path) => path,
+        None => "/usr/lib/systemd/systemd-udevd",
+    };
+    Command::new(
+        options
+            .udevd_path
+            .unwrap_or_else(|| DEFAULT_UDEVD_PATH.parse().unwrap()),
+    )
+    .spawn()
+    .context("Running systemd-udevd")?;
 
     if let Some(emulator) = options.emulator {
         match emulator {
             Emulator::Box => setup_box()?,
             Emulator::Fex => setup_fex()?,
         };
-    } else if let Err(err) = setup_fex() {
-        eprintln!("Error setting up FEX in binfmt_misc: {err}");
-        eprintln!("Failed to find or configure FEX, falling back to Box");
+    } else {
+        #[cfg(target_arch = "aarch64")]
+        if let Err(err) = setup_fex() {
+            eprintln!("Error setting up FEX in binfmt_misc: {err}");
+            eprintln!("Failed to find or configure FEX, falling back to Box");
 
-        if let Err(err) = setup_box() {
-            eprintln!("Error setting up Box in binfmt_misc: {err}");
-            eprintln!("No emulators were configured, x86 emulation may not work");
+            if let Err(err) = setup_box() {
+                eprintln!("Error setting up Box in binfmt_misc: {err}");
+                eprintln!("No emulators were configured, x86 emulation may not work");
+            }
         }
     }
 
     for init_command in options.init_commands {
         let code = Command::new(&init_command)
             .current_dir(&options.cwd)
-            .spawn()?
+            .spawn()
+            .context(format!(
+                "Failed to spawn init command `{}`",
+                init_command.display()
+            ))?
             .wait()?;
         if !code.success() {
             return Err(anyhow!("Executing `{}` failed", init_command.display()));
@@ -110,6 +127,20 @@ fn main() -> Result<()> {
         Ok(p) => p,
         Err(err) => return Err(err).context("Failed to set up user, bailing out"),
     };
+
+    for init_command in options.user_init_commands {
+        let code = Command::new(&init_command)
+            .current_dir(&options.cwd)
+            .spawn()
+            .context(format!(
+                "Failed to spawn user init command `{}`",
+                init_command.display()
+            ))?
+            .wait()?;
+        if !code.success() {
+            return Err(anyhow!("Executing `{}` failed", init_command.display()));
+        }
+    }
 
     let pulse_path = run_path.join("pulse");
     std::fs::create_dir(&pulse_path)
