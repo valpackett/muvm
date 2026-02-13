@@ -32,7 +32,7 @@ const VIRTGPU_BLOB_MEM_HOST3D: u32 = 0x0002;
 const VIRTGPU_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 const VIRTGPU_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
 const VIRTGPU_EVENT_FENCE_SIGNALED: u32 = 0x90000000;
-const CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB: u32 = 1;
+pub const CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB: u32 = 1;
 
 #[repr(C)]
 #[derive(Default)]
@@ -1017,6 +1017,32 @@ pub fn bridge_loop_sock<T: ProtocolHandler>(listen_sock: UnixListener) {
                 Client::new(stream, T::new(), sub_poll).unwrap();
                 continue;
             }
+            let client = {
+                // Ensure the borrow on `clients` is dropped when we are calling `process_epoll`
+                clients.borrow().get(&fd).cloned()
+            };
+            if let Some(client) = client {
+                client.borrow_mut().process_epoll(fd, events);
+            }
+        }
+    }
+}
+
+pub fn bridge_loop_client<T: ProtocolHandler>(client_sock: UnixStream) {
+    client_sock.set_nonblocking(true).unwrap();
+    let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
+    let clients = Rc::new(RefCell::new(HashMap::<u64, Rc<RefCell<Client<T>>>>::new()));
+    let sub_poll = SubPoll::new(&epoll, clients.clone());
+    Client::new(client_sock, T::new(), sub_poll).unwrap();
+    loop {
+        let mut evts = [EpollEvent::empty(); 16];
+        let count = match epoll.wait(&mut evts, EpollTimeout::NONE) {
+            Err(Errno::EINTR) | Ok(0) => continue,
+            a => a.unwrap(),
+        };
+        for evt in &evts[..count.min(evts.len())] {
+            let fd = evt.data();
+            let events = evt.events();
             let client = {
                 // Ensure the borrow on `clients` is dropped when we are calling `process_epoll`
                 clients.borrow().get(&fd).cloned()

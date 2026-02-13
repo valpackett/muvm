@@ -7,7 +7,8 @@ use std::{cmp, env, fs, thread};
 
 use anyhow::{anyhow, Context, Result};
 use muvm::guest::box64::setup_box;
-use muvm::guest::bridge::common::{bridge_loop, bridge_loop_with_listenfd};
+use muvm::guest::bridge::common::{bridge_loop, bridge_loop_client, bridge_loop_with_listenfd};
+use muvm::guest::bridge::dbus::DBusProtocolHandler;
 use muvm::guest::bridge::pipewire::{pipewire_sock_path, PipeWireProtocolHandler};
 use muvm::guest::bridge::x11::{start_x11bridge, X11ProtocolHandler};
 use muvm::guest::fex::setup_fex;
@@ -54,6 +55,15 @@ fn main() -> Result<ExitCode> {
         },
         "muvm-x11bridge" => {
             bridge_loop_with_listenfd::<X11ProtocolHandler>(|| "/tmp/.X11-unix/X1".to_owned());
+            return Ok(ExitCode::SUCCESS);
+        },
+        "muvm-dbusbridge" => {
+            let var = env::var("DBUS_SESSION_BUS_ADDRESS")
+                .context("expected DBUS_SESSION_BUS_ADDRESS to be set")?;
+            let path = var.strip_prefix("unix:path=").unwrap();
+            let stream = std::os::unix::net::UnixStream::connect(path)?;
+            stream.set_nonblocking(true).unwrap();
+            bridge_loop_client::<DBusProtocolHandler>(stream);
             return Ok(ExitCode::SUCCESS);
         },
         "muvm-hidpipe" => {
