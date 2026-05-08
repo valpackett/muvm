@@ -13,7 +13,7 @@ use std::{env, fs, mem, slice, thread};
 use anyhow::Result;
 use log::debug;
 use nix::errno::Errno;
-use nix::libc::{c_int, c_void, off_t, O_RDWR};
+use nix::libc::{c_int, c_void, off_t, O_RDONLY, O_RDWR};
 use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
 use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags, RecvMsg};
@@ -32,7 +32,9 @@ const VIRTGPU_BLOB_MEM_HOST3D: u32 = 0x0002;
 const VIRTGPU_BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
 const VIRTGPU_BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
 const VIRTGPU_EVENT_FENCE_SIGNALED: u32 = 0x90000000;
-const CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB: u32 = 1;
+const CROSS_DOMAIN_CHANNEL_TYPE_INTERNAL_SOCKET: u32 = u32::MAX;
+pub const CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB: u32 = 1;
+pub const CROSS_DOMAIN_ID_TYPE_SOCKET: u32 = 7;
 
 #[repr(C)]
 #[derive(Default)]
@@ -169,7 +171,7 @@ impl CrossDomainHeader {
 
 const CROSS_DOMAIN_CMD_INIT: u8 = 1;
 const CROSS_DOMAIN_CMD_POLL: u8 = 3;
-const CROSS_DOMAIN_PROTOCOL_VERSION: u32 = 1;
+
 #[repr(C)]
 #[derive(Default)]
 struct CrossDomainInit {
@@ -177,7 +179,16 @@ struct CrossDomainInit {
     query_ring_id: u32,
     channel_ring_id: u32,
     channel_type: u32,
-    protocol_version: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CrossDomainInitWithToken {
+    hdr: CrossDomainHeader,
+    query_ring_id: u32,
+    channel_ring_id: u32,
+    channel_type: u32,
+    internal_socket_uuid: [u8; 16],
 }
 
 #[repr(C)]
@@ -283,7 +294,7 @@ pub struct Context {
 }
 
 impl Context {
-    fn new(channel_type: u32) -> Result<Context> {
+    fn new(channel_type: u32, socket_uuid: Option<[u8; 16]>) -> Result<Context> {
         let mut params = [
             DrmVirtgpuContextSetParam {
                 param: VIRTGPU_CONTEXT_PARAM_CAPSET_ID,
@@ -320,17 +331,30 @@ impl Context {
             query_ring,
             channel_ring,
         };
-        let init_cmd = CrossDomainInit {
-            hdr: CrossDomainHeader::new(
-                CROSS_DOMAIN_CMD_INIT,
-                mem::size_of::<CrossDomainInit>() as u16,
-            ),
-            query_ring_id: this.query_ring.res_id,
-            channel_ring_id: this.channel_ring.res_id,
-            channel_type,
-            protocol_version: CROSS_DOMAIN_PROTOCOL_VERSION,
-        };
-        this.submit_cmd(&init_cmd, mem::size_of::<CrossDomainInit>(), None)?;
+        if let Some(token) = socket_uuid {
+            let init_cmd = CrossDomainInitWithToken {
+                hdr: CrossDomainHeader::new(
+                    CROSS_DOMAIN_CMD_INIT,
+                    mem::size_of::<CrossDomainInitWithToken>() as u16,
+                ),
+                query_ring_id: this.query_ring.res_id,
+                channel_ring_id: this.channel_ring.res_id,
+                channel_type: CROSS_DOMAIN_CHANNEL_TYPE_INTERNAL_SOCKET,
+                internal_socket_uuid: token,
+            };
+            this.submit_cmd(&init_cmd, mem::size_of::<CrossDomainInitWithToken>(), None)?;
+        } else {
+            let init_cmd = CrossDomainInit {
+                hdr: CrossDomainHeader::new(
+                    CROSS_DOMAIN_CMD_INIT,
+                    mem::size_of::<CrossDomainInit>() as u16,
+                ),
+                query_ring_id: this.query_ring.res_id,
+                channel_ring_id: this.channel_ring.res_id,
+                channel_type,
+            };
+            this.submit_cmd(&init_cmd, mem::size_of::<CrossDomainInit>(), None)?;
+        }
         this.poll_cmd()?;
         Ok(this)
     }
@@ -506,12 +530,13 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
     fn new(
         socket: UnixStream,
         protocol_handler: P,
+        socket_uuid: Option<[u8; 16]>,
         sub_poll: SubPoll<'a, P>,
     ) -> Result<Rc<RefCell<Client<'a, P>>>> {
         let this = Rc::new(RefCell::new(Client {
             socket,
             protocol_handler,
-            gpu_ctx: Context::new(P::CHANNEL_TYPE)?,
+            gpu_ctx: Context::new(P::CHANNEL_TYPE, socket_uuid)?,
             reply_tail: 0,
             reply_head: Vec::new(),
             request_tail: 0,
@@ -525,9 +550,10 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
             let mut borrow = this.borrow_mut();
             let borrow = &mut *borrow;
             borrow.sub_poll.my_client = Rc::downgrade(&this);
-            borrow
-                .sub_poll
-                .add(borrow.socket.as_fd(), EpollFlags::EPOLLIN);
+            borrow.sub_poll.add(
+                borrow.socket.as_fd(),
+                EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP,
+            );
             borrow
                 .sub_poll
                 .add(borrow.gpu_ctx.fd.as_fd(), EpollFlags::EPOLLIN);
@@ -550,6 +576,9 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
             if self.send_queue.is_empty() {
                 return Ok(ClientEvent::StopSend);
             }
+        }
+        if events.contains(EpollFlags::EPOLLRDHUP) {
+            return Ok(ClientEvent::Close);
         }
         Ok(ClientEvent::None)
     }
@@ -877,12 +906,14 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
                 ClientEvent::StartSend => {
                     self.sub_poll.modify(
                         self.socket.as_fd(),
-                        EpollFlags::EPOLLOUT | EpollFlags::EPOLLIN,
+                        EpollFlags::EPOLLOUT | EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP,
                     );
                 },
                 ClientEvent::StopSend => {
-                    self.sub_poll
-                        .modify(self.socket.as_fd(), EpollFlags::EPOLLIN);
+                    self.sub_poll.modify(
+                        self.socket.as_fd(),
+                        EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP,
+                    );
                 },
                 ClientEvent::Close => {
                     self.sub_poll.close();
@@ -902,7 +933,7 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
             } else if queue_empty && !self.send_queue.is_empty() {
                 self.sub_poll.modify(
                     self.socket.as_fd(),
-                    EpollFlags::EPOLLOUT | EpollFlags::EPOLLIN,
+                    EpollFlags::EPOLLOUT | EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP,
                 );
             }
         } else {
@@ -971,10 +1002,24 @@ impl<'a, T: ProtocolHandler> SubPoll<'a, T> {
     }
 }
 
+pub fn bridge_loop_with_listenfd<T: ProtocolHandler>(fallback_sock_path: impl Fn() -> String) {
+    if let Some(listen_sock) = listenfd::ListenFd::from_env()
+        .take_unix_listener(0)
+        .unwrap()
+    {
+        bridge_loop_sock::<T>(listen_sock)
+    } else {
+        bridge_loop::<T>(&fallback_sock_path())
+    }
+}
+
 pub fn bridge_loop<T: ProtocolHandler>(sock_path: &str) {
-    let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
     _ = fs::remove_file(sock_path);
-    let listen_sock = UnixListener::bind(sock_path).unwrap();
+    bridge_loop_sock::<T>(UnixListener::bind(sock_path).unwrap());
+}
+
+pub fn bridge_loop_sock<T: ProtocolHandler>(listen_sock: UnixListener) {
+    let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
     epoll
         .add(
             &listen_sock,
@@ -1000,7 +1045,7 @@ pub fn bridge_loop<T: ProtocolHandler>(sock_path: &str) {
                 let stream = res.unwrap().0;
                 stream.set_nonblocking(true).unwrap();
                 let sub_poll = SubPoll::new(&epoll, clients.clone());
-                Client::new(stream, T::new(), sub_poll).unwrap();
+                Client::new(stream, T::new(), None, sub_poll).unwrap();
                 continue;
             }
             let client = {
@@ -1009,6 +1054,38 @@ pub fn bridge_loop<T: ProtocolHandler>(sock_path: &str) {
             };
             if let Some(client) = client {
                 client.borrow_mut().process_epoll(fd, events);
+            }
+        }
+    }
+}
+
+pub fn bridge_loop_client<T: ProtocolHandler>(
+    client_sock: UnixStream,
+    socket_uuid: Option<[u8; 16]>,
+) {
+    client_sock.set_nonblocking(true).unwrap();
+    let epoll = Epoll::new(EpollCreateFlags::empty()).unwrap();
+    let clients = Rc::new(RefCell::new(HashMap::<u64, Rc<RefCell<Client<T>>>>::new()));
+    let sub_poll = SubPoll::new(&epoll, clients.clone());
+    Client::new(client_sock, T::new(), socket_uuid, sub_poll).unwrap();
+    loop {
+        let mut evts = [EpollEvent::empty(); 16];
+        let count = match epoll.wait(&mut evts, EpollTimeout::NONE) {
+            Err(Errno::EINTR) | Ok(0) => continue,
+            a => a.unwrap(),
+        };
+        for evt in &evts[..count.min(evts.len())] {
+            let fd = evt.data();
+            let events = evt.events();
+            let client = {
+                // Ensure the borrow on `clients` is dropped when we are calling `process_epoll`
+                clients.borrow().get(&fd).cloned()
+            };
+            if let Some(client) = client {
+                client.borrow_mut().process_epoll(fd, events);
+            }
+            if clients.borrow().is_empty() {
+                return;
             }
         }
     }
