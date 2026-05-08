@@ -550,9 +550,10 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
             let mut borrow = this.borrow_mut();
             let borrow = &mut *borrow;
             borrow.sub_poll.my_client = Rc::downgrade(&this);
-            borrow
-                .sub_poll
-                .add(borrow.socket.as_fd(), EpollFlags::EPOLLIN);
+            borrow.sub_poll.add(
+                borrow.socket.as_fd(),
+                EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP,
+            );
             borrow
                 .sub_poll
                 .add(borrow.gpu_ctx.fd.as_fd(), EpollFlags::EPOLLIN);
@@ -575,6 +576,9 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
             if self.send_queue.is_empty() {
                 return Ok(ClientEvent::StopSend);
             }
+        }
+        if events.contains(EpollFlags::EPOLLRDHUP) {
+            return Ok(ClientEvent::Close);
         }
         Ok(ClientEvent::None)
     }
@@ -902,12 +906,14 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
                 ClientEvent::StartSend => {
                     self.sub_poll.modify(
                         self.socket.as_fd(),
-                        EpollFlags::EPOLLOUT | EpollFlags::EPOLLIN,
+                        EpollFlags::EPOLLOUT | EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP,
                     );
                 },
                 ClientEvent::StopSend => {
-                    self.sub_poll
-                        .modify(self.socket.as_fd(), EpollFlags::EPOLLIN);
+                    self.sub_poll.modify(
+                        self.socket.as_fd(),
+                        EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP,
+                    );
                 },
                 ClientEvent::Close => {
                     self.sub_poll.close();
@@ -927,7 +933,7 @@ impl<'a, P: ProtocolHandler> Client<'a, P> {
             } else if queue_empty && !self.send_queue.is_empty() {
                 self.sub_poll.modify(
                     self.socket.as_fd(),
-                    EpollFlags::EPOLLOUT | EpollFlags::EPOLLIN,
+                    EpollFlags::EPOLLOUT | EpollFlags::EPOLLIN | EpollFlags::EPOLLRDHUP,
                 );
             }
         } else {
