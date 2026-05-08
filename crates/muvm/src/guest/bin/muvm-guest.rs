@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::panic::catch_unwind;
 use std::process::{Command, ExitCode};
 use std::{cmp, env, fs, thread};
@@ -50,6 +50,19 @@ fn main() -> Result<ExitCode> {
     match bb {
         "muvm-configure-network" => return configure_network().map(|()| ExitCode::SUCCESS),
         "muvm-pwbridge" => {
+            if let Ok(fd_num) = env::var("MUVM_PWBRIDGE_CLIENT_FD") {
+                let token = hex::decode(env::var("MUVM_PWBRIDGE_SOCKET_TOKEN").unwrap()).unwrap();
+                let stream = unsafe {
+                    std::os::unix::net::UnixStream::from(OwnedFd::from_raw_fd(
+                        i32::from_str_radix(&fd_num, 10).unwrap(),
+                    ))
+                };
+                bridge_loop_client::<PipeWireProtocolHandler>(
+                    stream,
+                    Some(token.try_into().unwrap()),
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
             bridge_loop_with_listenfd::<PipeWireProtocolHandler>(pipewire_sock_path);
             return Ok(ExitCode::SUCCESS);
         },
@@ -63,7 +76,7 @@ fn main() -> Result<ExitCode> {
             let path = var.strip_prefix("unix:path=").unwrap();
             let stream = std::os::unix::net::UnixStream::connect(path)?;
             stream.set_nonblocking(true).unwrap();
-            bridge_loop_client::<DBusProtocolHandler>(stream);
+            bridge_loop_client::<DBusProtocolHandler>(stream, None);
             return Ok(ExitCode::SUCCESS);
         },
         "muvm-hidpipe" => {

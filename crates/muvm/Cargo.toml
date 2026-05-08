@@ -30,6 +30,9 @@ tokio-stream = { version = "0.1.15", default-features = false, features = ["net"
 udev = { version = "0.9.0", default-features = false, features = [] }
 uuid = { version = "1.10.0", default-features = false, features = ["serde", "std", "v7"] }
 listenfd = "1.0.2"
+command-fds = "0.3"
+getrandom = "0.4"
+hex = "0.4"
 
 [[bin]]
 name = "muvm"
