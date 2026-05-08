@@ -41,6 +41,16 @@ struct CrossDomainImportVirtioFsHandle {
     pad: u32,
 }
 
+#[repr(C)]
+pub struct CrossDomainAssignSocketUuid {
+    hdr: CrossDomainHeader,
+    token: [u8; 16],
+    id: u32,
+    pad: u32,
+}
+
+pub const CROSS_DOMAIN_CHANNEL_TYPE_DBUS_SESSION: u32 = 0x0012;
+
 pub struct DBusResourceFinalizer;
 impl MessageResourceFinalizer for DBusResourceFinalizer {
     type Handler = DBusProtocolHandler;
@@ -51,6 +61,7 @@ impl MessageResourceFinalizer for DBusResourceFinalizer {
 }
 
 pub const CROSS_DOMAIN_CMD_IMPORT_VIRTIOFS_HANDLE: u8 = 12;
+pub const CROSS_DOMAIN_CMD_ASSIGN_SOCKET_UUID: u8 = 13;
 
 pub const CROSS_DOMAIN_ID_TYPE_VIRTIO_FS_BLOB: u32 = 6;
 
@@ -76,6 +87,40 @@ impl ProtocolHandler for DBusProtocolHandler {
             match ident.identifier_type {
                 common::CROSS_DOMAIN_ID_TYPE_VIRTGPU_BLOB => {
                     fds.push(this.virtgpu_id_to_prime(ident)?)
+                },
+                common::CROSS_DOMAIN_ID_TYPE_SOCKET => {
+                    let mut token = [0u8; 16];
+                    getrandom::fill(&mut token)?;
+                    let cmd = CrossDomainAssignSocketUuid {
+                        hdr: CrossDomainHeader::new(
+                            CROSS_DOMAIN_CMD_ASSIGN_SOCKET_UUID,
+                            mem::size_of::<CrossDomainAssignSocketUuid>() as u16,
+                        ),
+                        token,
+                        id: ident.identifier,
+                        pad: 0,
+                    };
+                    this.gpu_ctx.submit_cmd(
+                        &cmd,
+                        mem::size_of::<CrossDomainAssignSocketUuid>(),
+                        None,
+                    )?;
+                    let (client_half, proxy_half) = socketpair(
+                        AddressFamily::Unix,
+                        SockType::Stream,
+                        None,
+                        SockFlag::SOCK_CLOEXEC, // FdMapping will unset CLOEXEC when assigning the fd, but it won't close the others!
+                    )?;
+                    use command_fds::{CommandFdExt, FdMapping};
+                    std::process::Command::new("/opt/bin/muvm-pwbridge")
+                        .fd_mappings(vec![FdMapping {
+                            parent_fd: proxy_half,
+                            child_fd: 3,
+                        }])?
+                        .env("MUVM_PWBRIDGE_CLIENT_FD", "3")
+                        .env("MUVM_PWBRIDGE_SOCKET_TOKEN", hex::encode(token))
+                        .spawn()?;
+                    fds.push(client_half);
                 },
                 x => warn!("unsupported identifier type {} for dbus recv", x),
             };
